@@ -6,7 +6,7 @@
 # curl (>8.3.0)   https://github.com/curl/curl
 # openssl         https://github.com/openssl/openssl
 #
-# v1.0.0  04.02.2025
+# v1.0.1  03.03.2025
 
 set -eu # -o pipefail
 
@@ -14,19 +14,23 @@ set -eu # -o pipefail
 SCRIPT_DIR="$(dirname "$0")"
 
 # iLo
-FQDN="ilo.example.com"
-USERNAME="USER"
-PASSWORD='PASSW0RD'
+readonly FQDN="ilo.example.com"
+readonly USERNAME="USER"
+readonly PASSWORD='PA$$W0RD'
+
+# OpenSSL
+readonly CHECKEND=2592000 # 1 month in seconds
 
 # OVH
 # https://github.com/acmesh-official/acme.sh/wiki/How-to-use-OVH-domain-api
-_OVH_END_POINT="ovh-eu"							# OVH endpoint
-_OVH_AK=""										# Application key
-_OVH_AS=""										# Application secret
-_OVH_CK=""										# Consumer key
+readonly _OVH_END_POINT="ovh-eu" # OVH endpoint
+readonly _OVH_AK="xXx" # Application key
+readonly _OVH_AS="xXx" # Application secret
+readonly _OVH_CK="xXx" # Consumer key
 
 # ACME
-_ACME_SEVER="letsencrypt"						# letsencrypt_test -> for testing!
+readonly _ACME_SEVER="letsencrypt" # letsencrypt_test -> for testing!
+# /Config
 
 # Sing CSR
 function signCSR {
@@ -42,7 +46,8 @@ function signCSR {
 	if [[ "${_FORCE:-0}" -eq "0" ]]; then
 		if [[ -s "${SCRIPT_DIR}/${FQDN}/${FQDN}.csr" ]]; then
 			echo "Checking if already signed certificate is valid"
-			if openssl x509 -in "${SCRIPT_DIR}/${FQDN}/${FQDN}.cer" -noout -checkend 2592000; then
+			if openssl x509 -in "${SCRIPT_DIR}/${FQDN}/${FQDN}.cer" -noout -enddate -subject -checkend ${CHECKEND} \
+				> >(mapfile -t x509; echo -e "Valid to ${x509[0]#*=} for ${x509[1]#*=CN=}\n${x509[2]}\n"); then
 				# Valid
 				echo "Valid certificate found, skipping request signing"
 				return
@@ -52,7 +57,7 @@ function signCSR {
 		ACME_OPTS="--force"
 	fi
 
-	echo "Signing CSR"
+	echo "Signing CSR with ACME.sh"
 	if [[ -x "${SCRIPT_DIR}/acme.sh" ]]; then
 		"${SCRIPT_DIR}/acme.sh" --signcsr --csr "${SCRIPT_DIR}/${FQDN}.csr" --dns dns_ovh --server ${_ACME_SEVER} --home "${SCRIPT_DIR}" --log-level 1 "${ACME_OPTS}"
 	else
@@ -79,11 +84,11 @@ function requestCSR {
 		"https://${FQDN}/redfish/v1/Managers/1/SecurityService/HttpsCert/" | jq
 
 	# Attempt to grab the request
-	echo "This will take a while..."
+	echo "This will take a while…"
 	sleep 10
 	while true; do
 		curl -sS -k -u ${USERNAME}:${PASSWORD} \
-			"https://${FQDN}/redfish/v1/Managers/1/SecurityService/HttpsCert/" | jq -r '.CertificateSigningRequest // empty' > "${SCRIPT_DIR}/${FQDN}.csr"
+			"https://${FQDN}/redfish/v1/Managers/1/SecurityService/HttpsCert/" | jq -r '.CertificateSigningRequest // empty' >"${SCRIPT_DIR}/${FQDN}.csr"
 		if [[ -s "${SCRIPT_DIR}/${FQDN}.csr" ]]; then
 			break
 		else
@@ -97,10 +102,10 @@ function installCertificate {
 	# Install certificate and reset iLO
 	echo "Installing certificate"
 	curl -sS -k -X POST -H "Content-Type: application/json" \
-		 --variable "certificate@${SCRIPT_DIR}/${FQDN}/${FQDN}.cer" \
-		 --expand-data '{ "Action": "ImportCertificate", "Certificate": "{{certificate:json}}" }' \
-		 -u ${USERNAME}:${PASSWORD} \
-		 "https://${FQDN}/redfish/v1/Managers/1/SecurityService/HttpsCert/" | jq
+		--variable "certificate@${SCRIPT_DIR}/${FQDN}/${FQDN}.cer" \
+		--expand-data '{ "Action": "ImportCertificate", "Certificate": "{{certificate:json}}" }' \
+		-u ${USERNAME}:${PASSWORD} \
+		"https://${FQDN}/redfish/v1/Managers/1/SecurityService/HttpsCert/" | jq
 }
 
 function helpText {
@@ -110,22 +115,29 @@ function helpText {
 	exit
 }
 
-while getopts "fh" OPT; do
+while getopts "f" OPT; do
 	case "${OPT}" in
-		f) _FORCE="1" ;;
-		h) helpText ;;
-		*) helpText ;;
+	f) _FORCE="1" ;;
+	*) helpText ;;
 	esac
 done
 
 if [[ "${_FORCE:-0}" -eq "0" ]]; then
 	# Check if the certificate is expiring soon
-	if echo | openssl s_client -servername ${FQDN} -connect ${FQDN}:443 2>/dev/null | openssl x509 -noout -checkend 2592000 -checkhost ${FQDN}; then
+	if openssl x509 -noout -checkend ${CHECKEND} -enddate -subject -in \
+		<(openssl s_client -ign_eof -connect "${FQDN}:443" <<<$'HEAD / HTTP/1.0\r\n\r' 2> /dev/null) \
+		> >(mapfile -t x509; echo -e "Valid to ${x509[0]#*=} for ${x509[1]#*=CN=}\n${x509[2]}\n"); then
+		sleep 1
 		# Valid, bye
-		echo "iLO certificate is valid, nothing to do"
+		echo "Nothing to do this time"
+	else
+		# Expiring in less than one month
+		requestCSR
+		signCSR
+		installCertificate
 	fi
 else
-	# Expiring in less than one month or forced
+	# Forced
 	requestCSR
 	signCSR
 	installCertificate
